@@ -3,7 +3,7 @@ Queue management system for the Telegram to WhatsApp Sticker Converter Bot
 """
 
 import asyncio
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
 from dataclasses import dataclass
 from datetime import datetime
 import logging
@@ -16,7 +16,7 @@ class QueueItem:
     username: str
     chat_id: int
     message_id: int
-    pack_name: str
+    pack_input: Any  # Can be a string (short_name) or an InputStickerSet object
     timestamp: datetime
     status: str = "waiting"  # waiting, processing, completed, error
 
@@ -28,29 +28,27 @@ class QueueManager:
         self._lock = asyncio.Lock()
     
     async def add_to_queue(self, user_id: int, username: str, chat_id: int, 
-                          message_id: int, pack_name: str) -> int:
+                          message_id: int, pack_input: Any) -> int:
         """Add user to queue and return position"""
         async with self._lock:
-            # Check if user is already in queue
             if user_id in self.user_queues:
                 existing_item = self.user_queues[user_id]
                 if existing_item.status in ["waiting", "processing"]:
                     return self._get_position(user_id)
             
-            # Create new queue item
             queue_item = QueueItem(
                 user_id=user_id,
                 username=username,
                 chat_id=chat_id,
                 message_id=message_id,
-                pack_name=pack_name,
+                pack_input=pack_input,
                 timestamp=datetime.now()
             )
             
             self.queue.append(queue_item)
             self.user_queues[user_id] = queue_item
             
-            logger.info(f"Added user {username} (ID: {user_id}) to queue for pack: {pack_name}")
+            logger.info(f"Added user {username} (ID: {user_id}) to queue for pack: {pack_input}")
             return len(self.queue)
     
     async def get_next_item(self) -> Optional[QueueItem]:
@@ -62,7 +60,6 @@ class QueueManager:
             if not self.queue:
                 return None
             
-            # Get first item in queue
             item = self.queue.pop(0)
             item.status = "processing"
             self.processing = item
@@ -76,32 +73,11 @@ class QueueManager:
             if self.processing and self.processing.user_id == user_id:
                 self.processing.status = "completed" if success else "error"
                 
-                # Clean up
                 if user_id in self.user_queues:
                     del self.user_queues[user_id]
                 
                 logger.info(f"Completed processing for user {self.processing.username} (ID: {user_id}), success: {success}")
                 self.processing = None
-    
-    async def remove_from_queue(self, user_id: int) -> bool:
-        """Remove user from queue"""
-        async with self._lock:
-            if user_id not in self.user_queues:
-                return False
-            
-            item = self.user_queues[user_id]
-            
-            # If currently processing, can't remove
-            if item.status == "processing":
-                return False
-            
-            # Remove from queue
-            if item in self.queue:
-                self.queue.remove(item)
-            
-            del self.user_queues[user_id]
-            logger.info(f"Removed user {item.username} (ID: {user_id}) from queue")
-            return True
     
     def get_queue_position(self, user_id: int) -> Optional[int]:
         """Get user's position in queue"""
@@ -120,6 +96,7 @@ class QueueManager:
             return 1
         
         try:
+            # Position is 1-based index in queue + 1 if someone is processing
             return self.queue.index(item) + 1 + (1 if self.processing else 0)
         except ValueError:
             return 0

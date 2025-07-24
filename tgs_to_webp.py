@@ -135,7 +135,7 @@ class TGSToWebPConverter:
                 original_duration = original_total_frames / original_fps
                 
                 # Determine optimal output settings to preserve timing
-                max_frames = 60  # Performance limit
+                max_frames = 30  # Performance limit
                 
                 if original_total_frames <= max_frames:
                     # For short animations, keep all frames and adjust FPS to maintain duration
@@ -153,7 +153,7 @@ class TGSToWebPConverter:
             else:
                 # Use original logic with user-specified FPS
                 total_frames = int(lottie_animation.out_point - lottie_animation.in_point) if lottie_animation else 30
-                max_frames = 60
+                max_frames = 30
                 if total_frames > max_frames:
                     total_frames = max_frames
                     print(f"Limiting animation to a total of {max_frames} frames for performance")

@@ -1,15 +1,14 @@
 """
-Telegram bot handlers for the TG to WA Sticker Converter Bot
+Telegram bot handlers for the TG to WA Sticker Converter Bot (Telethon Version)
 """
 
 import os
 import asyncio
 import logging
-from typing import Optional
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
-from pyrogram import Client
-from pyrogram.errors import UserNotParticipant, ChatAdminRequired
+from telethon import TelegramClient, events, Button
+from telethon.errors.rpcerrorlist import UserNotParticipantError
+from telethon.tl.functions.channels import GetParticipantRequest
+from telethon.tl.types import DocumentAttributeSticker
 
 from config import *
 from utils import *
@@ -19,391 +18,220 @@ from sticker_converter import StickerConverter
 logger = logging.getLogger(__name__)
 
 class BotHandlers:
-    def __init__(self):
+    def __init__(self, client: TelegramClient):
+        """
+        Initializes the bot handlers with the Telethon client and other necessary components.
+        """
         ensure_directories()
-        
-        # Initialize Pyrogram client for sticker operations
-        self.pyrogram_client = Client(
-            "sticker_bot",
-            api_id=API_ID,
-            api_hash=API_HASH,
-            bot_token=BOT_TOKEN
-        )
-        
-        self.converter = StickerConverter(self.pyrogram_client)
+        self.client = client
+        self.converter = StickerConverter(self.client)
         self.processing_lock = asyncio.Lock()
-    
-    def _create_channel_join_buttons(self) -> InlineKeyboardMarkup:
-        """Dynamically creates the inline keyboard for joining required channels."""
-        # Get the list of channels from the config file
-        channels = REQUIRED_CHANNELS
-        keyboard = []
-        # Create a row of buttons, two at a time
-        for i in range(0, len(channels), 2):
-            row = []
-            # First button in the pair
-            channel1_username = channels[i]
-            # The channel username might contain '@', remove it for the button text
-            channel1_name = channel1_username.replace('@', '')
-            row.append(InlineKeyboardButton(f"Join {channel1_name}", url=f"https://t.me/{channel1_name}"))
 
-            # Check if there's a second channel for this row
-            if i + 1 < len(channels):
-                channel2_username = channels[i+1]
-                channel2_name = channel2_username.replace('@', '')
-                row.append(InlineKeyboardButton(f"Join {channel2_name}", url=f"https://t.me/{channel2_name}"))
+    def register_handlers(self):
+        """
+        Registers all event handlers with the Telethon client.
+        """
+        self.client.add_event_handler(self.start_command, events.NewMessage(pattern='/start', func=lambda e: e.is_private))
+        self.client.add_event_handler(self.help_command, events.NewMessage(pattern='/help', func=lambda e: e.is_private))
+        self.client.add_event_handler(self.handle_message, events.NewMessage(func=lambda e: e.is_private and (e.text or e.sticker)))
+        self.client.add_event_handler(self.handle_callback_query, events.CallbackQuery(func=lambda e: e.is_private))
+
+    def _create_channel_join_buttons(self) -> list:
+        """Dynamically creates the inline keyboard for joining required channels using Telethon's Button."""
+        keyboard = []
+        for i in range(0, len(REQUIRED_CHANNELS), 2):
+            row = []
+            channel1_username = REQUIRED_CHANNELS[i].replace('@', '')
+            row.append(Button.url(f"Join {channel1_username}", url=f"https://t.me/{channel1_username}"))
+
+            if i + 1 < len(REQUIRED_CHANNELS):
+                channel2_username = REQUIRED_CHANNELS[i+1].replace('@', '')
+                row.append(Button.url(f"Join {channel2_username}", url=f"https://t.me/{channel2_username}"))
             
             keyboard.append(row)
         
-        # Add the final "Check Again" button on its own row
-        keyboard.append([InlineKeyboardButton("✅ Check Again", callback_data="check_membership")])
-        
-        return InlineKeyboardMarkup(keyboard)
+        keyboard.append([Button.inline("✅ Check Again", b"check_membership")])
+        return keyboard
 
-    async def start_pyrogram(self):
-        """Start Pyrogram client"""
-        await self.pyrogram_client.start()
-    
-    async def stop_pyrogram(self):
-        """Stop Pyrogram client"""
-        await self.pyrogram_client.stop()
-    
     async def check_user_membership(self, user_id: int) -> bool:
-        """Check if user is member of required channels"""
+        """Check if user is a member of required channels using Telethon."""
+        if not REQUIRED_CHANNELS:
+            return True
         try:
             for channel in REQUIRED_CHANNELS:
                 try:
-                    member = await self.pyrogram_client.get_chat_member(channel, user_id)
-                    if member.status in ["left", "kicked"]:
-                        return False
-                except UserNotParticipant:
+                    await self.client(GetParticipantRequest(channel=channel, participant=user_id))
+                except UserNotParticipantError:
+                    logger.warning(f"User {user_id} is not a participant in {channel}.")
                     return False
                 except Exception as e:
-                    logger.warning(f"Error checking membership for {channel}: {e}")
-                    # If we can't check, assume they're not a member
+                    logger.error(f"Could not check membership for user {user_id} in {channel}: {e}")
                     return False
             return True
         except Exception as e:
-            logger.error(f"Error checking user membership: {e}")
+            logger.error(f"General error in check_user_membership for user {user_id}: {e}")
             return False
-    
-    async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /start command"""
-        user = update.effective_user
-        
-        # Check channel membership
+
+    async def start_command(self, event: events.NewMessage.Event):
+        """Handle /start command."""
+        user = await event.get_sender()
         if not await self.check_user_membership(user.id):
-            # DYNAMIC KEYBOARD
-            reply_markup = self._create_channel_join_buttons()
-            
-            await update.message.reply_text(
-                CHANNEL_JOIN_MESSAGE,
-                reply_markup=reply_markup
-            )
+            await event.reply(CHANNEL_JOIN_MESSAGE, buttons=self._create_channel_join_buttons())
             return
         
-        # Create inline keyboard
-        keyboard = [
-            [InlineKeyboardButton("📊 Check Queue", callback_data="check_queue")],
-            [InlineKeyboardButton("❓ Help", callback_data="help")]
+        buttons = [
+            [Button.inline("📊 Check Queue", b"check_queue"), Button.inline("❓ Help", b"help")]
         ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await update.message.reply_text(
-            START_MESSAGE,
-            reply_markup=reply_markup
-        )
-    
-    async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /help command"""
-        keyboard = [
-            [InlineKeyboardButton("📊 Check Queue", callback_data="check_queue")],
-            [InlineKeyboardButton("🏠 Back to Start", callback_data="start")]
+        await event.reply(START_MESSAGE, buttons=buttons)
+
+    async def help_command(self, event: events.NewMessage.Event):
+        """Handle /help command."""
+        buttons = [
+            [Button.inline("📊 Check Queue", b"check_queue"), Button.inline("🏠 Back to Start", b"start")]
         ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
+        await event.reply(HELP_MESSAGE, buttons=buttons)
+
+    async def handle_message(self, event: events.NewMessage.Event):
+        """Handle incoming messages (URLs or stickers)."""
+        user = await event.get_sender()
         
-        await update.message.reply_text(
-            HELP_MESSAGE,
-            reply_markup=reply_markup
-        )
-    
-    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle incoming messages (URLs or stickers)"""
-        user = update.effective_user
-        
-        # Check channel membership
         if not await self.check_user_membership(user.id):
-            
-            reply_markup = self._create_channel_join_buttons()
-            
-            await update.message.reply_text(
-                CHANNEL_JOIN_MESSAGE,
-                reply_markup=reply_markup
-            )
+            await event.reply(CHANNEL_JOIN_MESSAGE, buttons=self._create_channel_join_buttons())
             return
-        
-        # Check if user is already in queue
+
         if queue_manager.is_user_in_queue(user.id):
             position = queue_manager.get_queue_position(user.id)
             wait_time = estimate_wait_time(position - 1)
-            
-            keyboard = [[InlineKeyboardButton("📊 Check Queue", callback_data="check_queue")]]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            
-            await update.message.reply_text(
-                f"⏳ You're already in the queue!\n\n"
-                f"Position: {position}\n"
-                f"Estimated wait: {wait_time}",
-                reply_markup=reply_markup
+            await event.reply(
+                f"⏳ You're already in the queue!\n\nPosition: {position}\nEstimated wait: {wait_time}",
+                buttons=[[Button.inline("📊 Check Queue", b"check_queue")]]
             )
             return
-        
-        pack_name = None
-        
-        # Check if message contains a sticker pack URL
-        if update.message.text:
-            pack_name = extract_pack_name_from_url(update.message.text)
-            if not pack_name:
-                await update.message.reply_text(
+
+        pack_input = None
+        pack_display_name = "Unknown Pack"
+
+        if event.text:
+            pack_input = extract_pack_name_from_url(event.text)
+            if not pack_input:
+                await event.reply(
                     "❌ Invalid sticker pack URL!\n\n"
                     "Please send a valid Telegram sticker pack link (t.me/addstickers/packname) "
                     "or forward a sticker from the pack you want to convert."
                 )
                 return
-        
-        # Check if message contains a sticker
-        elif update.message.sticker:
-            if not update.message.sticker.set_name:
-                await update.message.reply_text(
-                    "❌ This sticker doesn't belong to a pack!\n\n"
-                    "Please forward a sticker from a sticker pack."
+            pack_display_name = pack_input
+        elif event.sticker:
+            for attr in event.sticker.attributes:
+                if isinstance(attr, DocumentAttributeSticker):
+                    pack_input = attr.stickerset
+                    pack_display_name = f"the sticker pack you forwarded"
+                    break
+            if not pack_input:
+                await event.reply(
+                    "❌ This sticker doesn't seem to belong to a pack I can access.\n\nPlease forward a sticker from a public sticker pack."
                 )
                 return
-            pack_name = update.message.sticker.set_name
-        
-        else:
-            await update.message.reply_text(
-                "❌ Unsupported message type!\n\n"
-                "Please send:\n"
-                "• A Telegram sticker pack link (t.me/addstickers/packname)\n"
-                "• Or forward a sticker from the pack you want to convert"
-            )
-            return
-        
-        # Add to queue
+
         user_display_name = get_user_display_name(user)
         position = await queue_manager.add_to_queue(
-            user.id, user_display_name, update.effective_chat.id,
-            update.message.message_id, pack_name
+            user.id, user_display_name, event.chat_id,
+            event.message.id, pack_input
         )
-        
         wait_time = estimate_wait_time(position - 1)
         
-        keyboard = [[InlineKeyboardButton("📊 Check Queue", callback_data="check_queue")]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await update.message.reply_text(
+        await event.reply(
             f"✅ Added to conversion queue!\n\n"
-            f"📦 Pack: {pack_name}\n"
-            f"📍 Position: {position}\n"
-            f"⏰ Estimated wait: {wait_time}\n\n"
+            f"📦 Pack: {pack_display_name}\n📍 Position: {position}\n⏰ Estimated wait: {wait_time}\n\n"
             f"I'll notify you when the conversion starts!",
-            reply_markup=reply_markup
+            buttons=[[Button.inline("📊 Check Queue", b"check_queue")]]
         )
-        
-        # Start processing if this is the first item
-        if position == 1:
+
+        if position == 1 and not self.processing_lock.locked():
             asyncio.create_task(self.process_queue())
-    
+
     async def process_queue(self):
-        """Process the conversion queue"""
+        """Process the conversion queue."""
         async with self.processing_lock:
             while True:
-                # Get next item to process
                 item = await queue_manager.get_next_item()
                 if not item:
                     break
                 
                 try:
-                    # Notify user that processing started
-                    await self.pyrogram_client.send_message(
-                        item.chat_id,
-                        f"🚀 Starting conversion for pack: {item.pack_name}\n\n"
-                        f"Please wait while I download and convert the stickers..."
-                    )
+                    await self.client.send_message(item.chat_id, f"🚀 Starting conversion for your requested sticker pack...")
                     
-                    # Get sticker set
-                    sticker_set = await self.converter.get_sticker_set(item.pack_name)
+                    sticker_set = await self.converter.get_sticker_set(item.pack_input)
                     if not sticker_set:
-                        await self.pyrogram_client.send_message(
-                            item.chat_id,
-                            f"❌ Failed to find sticker pack: {item.pack_name}\n\n"
-                            f"Please make sure the pack name is correct and the pack is public."
-                        )
+                        error_pack_name = item.pack_input if isinstance(item.pack_input, str) else "the pack you sent"
+                        await self.client.send_message(item.chat_id, f"❌ Failed to find sticker pack: `{error_pack_name}`. It might be private or invalid.")
                         await queue_manager.complete_processing(item.user_id, False)
                         continue
                     
-                    # Notify about pack details
-                    # Handle different response structures
-                    if hasattr(sticker_set, 'documents'):
-                        stickers = sticker_set.documents
-                        pack_title = sticker_set.set.title if hasattr(sticker_set, 'set') else "Unknown Pack"
-                    elif hasattr(sticker_set, 'stickers'):
-                        stickers = sticker_set.stickers
-                        pack_title = sticker_set.title if hasattr(sticker_set, 'title') else "Unknown Pack"
-                    else:
-                        stickers = []
-                        pack_title = "Unknown Pack"
-                    
-                    total_stickers = len(stickers)
+                    pack_title = sticker_set.set.title
+                    total_stickers = len(sticker_set.documents)
                     num_packs = (total_stickers + MAX_STICKERS_PER_PACK - 1) // MAX_STICKERS_PER_PACK
-                    
-                    await self.pyrogram_client.send_message(
+                    await self.client.send_message(
                         item.chat_id,
-                        f"📊 Pack Details:\n"
-                        f"• Name: {pack_title}\n"
-                        f"• Total stickers: {total_stickers}\n"
-                        f"• Will create {num_packs} .wastickers file(s)\n\n"
-                        f"🔄 Converting stickers..."
+                        f"📊 Pack Details:\n• Name: {pack_title}\n• Total stickers: {total_stickers}\n"
+                        f"• This will create {num_packs} .wastickers file(s)."
                     )
                     
-                    # Convert stickers
-                    wastickers_files = await self.converter.create_wastickers_pack(
-                        sticker_set, item.username
-                    )
+                    wastickers_files = await self.converter.create_wastickers_pack(sticker_set, item.username)
                     
                     if wastickers_files:
-                        # Send converted files
-                        await self.pyrogram_client.send_message(
-                            item.chat_id,
-                            f"✅ Conversion completed successfully!\n\n"
-                            f"📁 Generated {len(wastickers_files)} file(s):"
-                        )
-                        
+                        await self.client.send_message(item.chat_id, f"✅ Conversion complete! Sending {len(wastickers_files)} file(s)...")
                         for i, file_path in enumerate(wastickers_files):
-                            if os.path.exists(file_path):
-                                file_size = format_file_size(os.path.getsize(file_path))
-                                caption = f"📦 Part {i+1}/{len(wastickers_files)} - {file_size}"
-                                
-                                await self.pyrogram_client.send_document(
-                                    item.chat_id,
-                                    file_path,
-                                    caption=caption
-                                )
-                                
-                                # Clean up file
-                                os.remove(file_path)
+                            caption = f"📦 {os.path.basename(file_path)} - Part {i+1}/{len(wastickers_files)}\nSize: {format_file_size(os.path.getsize(file_path))}"
+                            await self.client.send_file(item.chat_id, file_path, caption=caption)
+                            os.remove(file_path)
                         
-                        # Send instructions
-                        await self.pyrogram_client.send_message(
-                            item.chat_id,
-                            "📱 To import to WhatsApp:\n"
-                            "1. Download a 'Sticker Maker' app\n"
-                            "2. Import the .wastickers file(s)\n"
-                            "3. Add to WhatsApp following the app's instructions\n\n"
-                            "🎉 Enjoy your stickers!"
-                        )
-                        
+                        await self.client.send_message(item.chat_id, "📱 To import to WhatsApp, use an app like 'Sticker Maker' on your phone. Enjoy!")
                         await queue_manager.complete_processing(item.user_id, True)
                     else:
-                        await self.pyrogram_client.send_message(
-                            item.chat_id,
-                            f"❌ Failed to convert sticker pack: {item.pack_name}\n\n"
-                            f"This might be due to:\n"
-                            f"• Pack contains unsupported formats\n"
-                            f"• Network issues\n"
-                            f"• Pack is private or restricted\n\n"
-                            f"Please try again later."
-                        )
+                        await self.client.send_message(item.chat_id, f"❌ Failed to convert the sticker pack '{pack_title}'. There might have been an issue with the sticker files themselves.")
                         await queue_manager.complete_processing(item.user_id, False)
                 
                 except Exception as e:
-                    logger.error(f"Error processing queue item: {e}")
+                    logger.error(f"Error processing queue item for user {item.user_id}: {e}", exc_info=True)
                     try:
-                        await self.pyrogram_client.send_message(
-                            item.chat_id,
-                            f"❌ An error occurred during conversion.\n\n"
-                            f"Please try again later."
-                        )
-                    except:
-                        pass
+                        await self.client.send_message(item.chat_id, "❌ An unexpected error occurred during conversion. The developers have been notified. Please try again later.")
+                    except: pass
                     await queue_manager.complete_processing(item.user_id, False)
-    
-    async def handle_callback_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle callback queries from inline keyboards"""
-        query = update.callback_query
-        user = update.effective_user
-        
-        await query.answer()
-        
-        if query.data == "check_membership":
+
+    async def handle_callback_query(self, event: events.CallbackQuery.Event):
+        """Handle callback queries from inline keyboards."""
+        user = await event.get_sender()
+        data = event.data.decode('utf-8')
+
+        await event.answer()
+
+        if data == "check_membership":
             if await self.check_user_membership(user.id):
-                keyboard = [
-                    [InlineKeyboardButton("📊 Check Queue", callback_data="check_queue")],
-                    [InlineKeyboardButton("❓ Help", callback_data="help")]
-                ]
-                reply_markup = InlineKeyboardMarkup(keyboard)
-                
-                await query.edit_message_text(
-                    "✅ Great! You're now a member of both channels.\n\n" + START_MESSAGE,
-                    reply_markup=reply_markup
-                )
+                buttons = [[Button.inline("📊 Check Queue", b"check_queue"), Button.inline("❓ Help", b"help")]]
+                await event.edit("✅ Great! You're now a member.\n\n" + START_MESSAGE, buttons=buttons)
             else:
-                await query.edit_message_text(
-                    "❌ You still need to join both channels to use this bot.\n\n" + CHANNEL_JOIN_MESSAGE,
-                    reply_markup=query.message.reply_markup
-                )
+                await event.edit("❌ You still need to join the required channels.\n\n" + CHANNEL_JOIN_MESSAGE, buttons=self._create_channel_join_buttons())
         
-        elif query.data == "check_queue":
+        elif data == "check_queue":
             position = queue_manager.get_queue_position(user.id)
             stats = queue_manager.get_queue_stats()
-            
             if position:
-                wait_time = estimate_wait_time(position - 1)
                 message = QUEUE_CHECK_MESSAGE.format(
                     position=position,
                     total=stats["total_waiting"] + (1 if stats["currently_processing"] else 0),
-                    wait_time=wait_time
+                    wait_time=estimate_wait_time(position - 1)
                 )
             else:
-                message = (
-                    "📊 Queue Status\n\n"
-                    f"You're not currently in the queue.\n"
-                    f"Total users waiting: {stats['total_waiting']}\n"
-                    f"Currently processing: {'Yes' if stats['currently_processing'] else 'No'}"
-                )
+                message = f"📊 You're not in the queue. Total users waiting: {stats['total_waiting']}."
             
-            keyboard = [[InlineKeyboardButton("🔄 Refresh", callback_data="check_queue")]]
+            buttons = [[Button.inline("🔄 Refresh", b"check_queue")]]
             if position is None:
-                keyboard.append([InlineKeyboardButton("🏠 Back to Start", callback_data="start")])
-            
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            await query.edit_message_text(message, reply_markup=reply_markup)
+                buttons.append([Button.inline("🏠 Back to Start", b"start")])
+            await event.edit(message, buttons=buttons)
         
-        elif query.data == "help":
-            keyboard = [
-                [InlineKeyboardButton("📊 Check Queue", callback_data="check_queue")],
-                [InlineKeyboardButton("🏠 Back to Start", callback_data="start")]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            await query.edit_message_text(HELP_MESSAGE, reply_markup=reply_markup)
-        
-        elif query.data == "start":
-            if not await self.check_user_membership(user.id):
-                keyboard = [
-                    [InlineKeyboardButton("Join @nub_coder_updates", url="https://t.me/nub_coder_updates")],
-                    [InlineKeyboardButton("Join @nub_coder_s", url="https://t.me/nub_coder_s")],
-                    [InlineKeyboardButton("✅ Check Again", callback_data="check_membership")]
-                ]
-                reply_markup = InlineKeyboardMarkup(keyboard)
-                await query.edit_message_text(CHANNEL_JOIN_MESSAGE, reply_markup=reply_markup)
-            else:
-                keyboard = [
-                    [InlineKeyboardButton("📊 Check Queue", callback_data="check_queue")],
-                    [InlineKeyboardButton("❓ Help", callback_data="help")]
-                ]
-                reply_markup = InlineKeyboardMarkup(keyboard)
-                await query.edit_message_text(START_MESSAGE, reply_markup=reply_markup)
+        elif data == "help":
+            await self.help_command(event)
 
-# Global handlers instance
-bot_handlers = BotHandlers()
+        elif data == "start":
+            await self.start_command(event)

@@ -1,0 +1,5 @@
+telethon
+pillow
+lottie
+opencv-python
+cairosvg

@@ -3,13 +3,13 @@ Configuration file for the Telegram to WhatsApp Sticker Converter Bot
 """
 
 # Telegram API Credentials
-API_ID = # Your API ID
-API_HASH = ""
-BOT_TOKEN = ""
-BOT_USERNAME = ""
+API_ID = 20430589 # Your API ID
+API_HASH = "d8a15ae0a1320abbc27c5482c62e8ed0"
+BOT_TOKEN = "7673444331:AAHuOKAuzwhc7T6VNfkanKadZ4cdc2xfxg0"
+BOT_USERNAME = "@TGtoWAstickerConverterBot"
 
 # Required channels for membership verification
-REQUIRED_CHANNELS = [] # ["@your_channels_here", "@your_channels_here"]
+REQUIRED_CHANNELS = ["@test_anyt"] # ["@your_channels_here", "@your_channels_here"]
 
 # Sticker pack constraints
 MAX_STICKERS_PER_PACK = 30
@@ -37,7 +37,7 @@ I can help you convert Telegram sticker packs to WhatsApp compatible .wastickers
 • Optimize file sizes for WhatsApp compatibility
 
 🚀 How to use:
-1. Send me a Telegram sticker pack link (t.me/addstickers/packname)
+1. Send me a Telegram sticker pack link (t.me/addstickers/<packname>)
 2. Or forward any sticker from the pack you want to convert
 3. Wait for the conversion to complete
 4. Download your .wastickers file(s)
