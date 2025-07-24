@@ -3,10 +3,10 @@ Configuration file for the Telegram to WhatsApp Sticker Converter Bot
 """
 
 # Telegram API Credentials
-API_ID = 20430589 # Your API ID
-API_HASH = "d8a15ae0a1320abbc27c5482c62e8ed0"
-BOT_TOKEN = "7673444331:AAHuOKAuzwhc7T6VNfkanKadZ4cdc2xfxg0"
-BOT_USERNAME = "@TGtoWAstickerConverterBot"
+API_ID =  # Your API ID
+API_HASH = "" # Your API HASH here
+BOT_TOKEN = "" # Your bot token here
+BOT_USERNAME = "@" # Your bot username
 
 # Required channels for membership verification
 REQUIRED_CHANNELS = ["@test_anyt"] # ["@your_channels_here", "@your_channels_here"]
@@ -14,7 +14,7 @@ REQUIRED_CHANNELS = ["@test_anyt"] # ["@your_channels_here", "@your_channels_her
 # Sticker pack constraints
 MAX_STICKERS_PER_PACK = 30
 MAX_STICKER_SIZE_STATIC = 100 * 1024  # 100KB
-MAX_STICKER_SIZE_DYNAMIC = 500*1024 # 500KB
+MAX_STICKER_SIZE_DYNAMIC = 500 * 1024 # 500KB
 
 MAX_ICON_SIZE = 50 * 1024      # 50KB
 STICKER_DIMENSIONS = (512, 512)
