@@ -5,8 +5,9 @@ A simple Python module for converting TGS (Telegram animated stickers) to WebP f
 TGS files are gzip-compressed Lottie JSON animations.
 """
 
-import os
+import os 
 import tempfile
+import io
 from PIL import Image, ImageDraw
 from lottie import objects
 from lottie.exporters.cairo import export_png
@@ -33,7 +34,74 @@ class TGSToWebPConverter:
         self.quality = quality
         self.preserve_timing = preserve_timing
     
+    def _save_webp_to_buffer(self, frames: list, quality: int, fps: float) -> int:
+        """Saves a list of frames to an in-memory WebP buffer and returns the size in bytes."""
+        if not frames:
+            return float('inf')  # Return infinity if no frames to avoid errors
 
+        frame_duration = int(1000 / fps)
+        buffer = io.BytesIO()
+
+        frames[0].save(
+            buffer,
+            format='WebP',
+            save_all=True,
+            append_images=frames[1:],
+            duration=frame_duration,
+            loop=0,
+            quality=quality,
+            method=6
+        )
+        return buffer.getbuffer().nbytes
+    
+    @staticmethod
+    def _binary_search(target_range: tuple, search_space: tuple, evaluator_func) -> tuple[int, int]:
+        """
+        Performs a binary search to find a value in search_space that results
+        in an outcome within target_range.
+
+        Args:
+            target_range: A (min, max) tuple for the desired outcome (file size).
+            search_space: A (min, max) tuple for the values to search (e.g., frame count or quality).
+            evaluator_func: A function that takes a value from search_space and returns an outcome.
+
+        Returns:
+            A tuple of (best_value, best_size). Returns (None, None) if no suitable value is found.
+        """
+        low, high = search_space
+        best_value = None
+        best_size = float('inf')
+
+        # To handle integer ranges correctly
+        low, high = int(low), int(high)
+        if low > high:
+            return None, None
+
+        while low <= high:
+            mid = (low + high) // 2
+            if mid == 0: # Avoid getting stuck at 0
+                mid = 1
+
+            current_size = evaluator_func(mid)
+
+            if target_range[0] <= current_size <= target_range[1]:
+                # Perfect match! We are within our target size bracket.
+                return mid, current_size
+            elif current_size < target_range[0]:
+                # The file is too small, try for better quality/more frames.
+                best_value = mid # This is a valid, but small, option
+                best_size = current_size
+                low = mid + 1
+            else:
+                # The file is too big, we must reduce quality/frames.
+                high = mid - 1
+        
+        # If we never hit the target range exactly, return the best value found that was *under* the max
+        # This is useful if the target range [400, 500] is missed, but we found a solution that is, say, 390KB.
+        if best_value is not None and best_size <= target_range[1]:
+             return best_value, best_size
+             
+        return None, None
     
     def _render_lottie_frame(self, lottie_animation, frame_num: int, total_frames: int) -> Image.Image:
         """
@@ -104,91 +172,150 @@ class TGSToWebPConverter:
     
     def convert(self, tgs_path: str, webp_path: str) -> bool:
         """
-        Convert TGS file to animated WebP.
-        
-        Args:
-            tgs_path: Path to input TGS file
-            webp_path: Path to output WebP file
-            
-        Returns:
-            True if conversion successful, False otherwise
-            
-        Raises:
-            FileNotFoundError: If TGS file doesn't exist
-            ValueError: If TGS file is invalid
-            IOError: If output file cannot be written
+        Convert TGS file to animated WebP with a size cap of ~500KB.
         """
         if not os.path.exists(tgs_path):
             raise FileNotFoundError(f"TGS file not found: {tgs_path}")
-        
+
+        # --- Stage 1: Parse and Render ALL Original Frames ---
         try:
-            # Parse TGS file using lottie library
             with open(tgs_path, 'rb') as f:
                 lottie_animation = parse_tgs(f)
+        except Exception as e:
+            raise ValueError(f"TGS file is invalid or could not be parsed: {e}")
+
+        original_total_frames = int(lottie_animation.out_point - lottie_animation.in_point)
+        original_fps = lottie_animation.frame_rate
+        original_duration = original_total_frames / original_fps
+        
+        print("Pre-rendering all original frames... this might take a moment.")
+        all_frames = [self._render_lottie_frame(lottie_animation, i, original_total_frames) for i in range(original_total_frames)]
+        
+        if not all_frames:
+            raise ValueError("Could not render any frames from the TGS file.")
+
+        # --- Stage 2: The Optimization Gauntlet! ---
+        SIZE_CAP_KB = 450
+        SIZE_TARGET_RANGE = (400 * 1024, SIZE_CAP_KB * 1024)  # Target [400KB, 500KB]
+        MAX_FRAMES_CAP = 60
+        FRAME_PIVOT = MAX_FRAMES_CAP // 2
+
+        final_frames = None
+        final_quality = self.quality # Start with default quality
+        
+        # Helper to select a subset of frames evenly
+        def select_frames(source_frames, count):
+            if count >= len(source_frames):
+                return source_frames
+            indices = [int(i * (len(source_frames) - 1) / (count - 1)) for i in range(count)]
+            return [source_frames[i] for i in indices]
+
+        # Define evaluators for binary search
+        def eval_frames(num_frames):
+            frames_to_test = select_frames(all_frames, num_frames)
+            fps = len(frames_to_test) / original_duration
+            return self._save_webp_to_buffer(frames_to_test, final_quality, fps)
+
+        def eval_quality(quality):
+            fps = len(final_frames) / original_duration
+            return self._save_webp_to_buffer(final_frames, quality, fps)
             
-            # Get animation properties
-            original_total_frames = int(lottie_animation.out_point - lottie_animation.in_point) if lottie_animation else 30
-            original_fps = lottie_animation.frame_rate if lottie_animation else 30.0
+        # Determine initial frame count based on caps
+        initial_frame_count = min(original_total_frames, MAX_FRAMES_CAP)
+        final_frames = select_frames(all_frames, initial_frame_count)
+
+        # --- Run the multi-stage search logic ---
+        print(f"Aiming for a file size under {SIZE_CAP_KB}KB.")
+
+        # Stage A: Try with max frames at default quality
+        print(f"[*] Stage A: Testing with {len(final_frames)} frames @ Q={final_quality}...")
+        current_size = self._save_webp_to_buffer(final_frames, final_quality, len(final_frames) / original_duration)
+        
+        if current_size <= SIZE_TARGET_RANGE[1]:
+            print(f"☑️ Success! Size is {current_size / 1024:.1f}KB. No further optimization needed.")
+        else:
+            print(f"-> Too big ({current_size / 1024:.1f}KB). Starting advanced optimization...")
+            # --- Your algorithm begins! ---
             
-            if self.preserve_timing:
-                # Calculate original duration in seconds
-                original_duration = original_total_frames / original_fps
-                
-                # Determine optimal output settings to preserve timing
-                max_frames = 30  # Performance limit
-                
-                if original_total_frames <= max_frames:
-                    # For short animations, keep all frames and adjust FPS to maintain duration
-                    total_frames = original_total_frames
-                    output_fps = total_frames / original_duration
-                    print(f"Preserving all {total_frames} frames, adjusting FPS to {output_fps:.1f} to maintain {original_duration:.2f}s duration")
-                else:
-                    # For long animations, limit frames but maintain duration
-                    total_frames = max_frames
-                    output_fps = total_frames / original_duration
-                    print(f"Limiting to a total of {max_frames} frames, adjusting FPS to {output_fps:.1f} to maintain {original_duration:.2f}s duration")
-                
-                # Store the calculated FPS for frame duration calculation
-                self._calculated_fps = output_fps
+            # Decide search ranges based on original frame count
+            if original_total_frames > MAX_FRAMES_CAP:
+                frame_range_1 = (FRAME_PIVOT, MAX_FRAMES_CAP)
+                frame_range_2 = (1, FRAME_PIVOT)
+                quality_range_1 = (40, 80)
+                quality_range_2 = (1, 40)
+                fallback_frame_count = FRAME_PIVOT
             else:
-                # Use original logic with user-specified FPS
-                total_frames = int(lottie_animation.out_point - lottie_animation.in_point) if lottie_animation else 30
-                max_frames = 30
-                if total_frames > max_frames:
-                    total_frames = max_frames
-                    print(f"Limiting animation to a total of {max_frames} frames for performance")
-                self._calculated_fps = self.fps
+                frame_range_1 = (original_total_frames / 2, original_total_frames)
+                frame_range_2 = (1, original_total_frames / 2)
+                quality_range_1 = (40, 80)
+                quality_range_2 = (1, 40)
+                fallback_frame_count = int(original_total_frames / 2)
+
+            # Stage B: Binary search on frame count [X, Y] @ Q=80
+            print(f"[*] Stage B: Searching frame count in [{int(frame_range_1[0])}, {int(frame_range_1[1])}] @ Q=80...")
+            best_f, best_s = self._binary_search(SIZE_TARGET_RANGE, frame_range_1, eval_frames)
+
+            if best_f:
+                final_frames = select_frames(all_frames, best_f)
+                current_size = best_s
+                print(f"-> ☑️ Found solution: {len(final_frames)} frames, size {current_size / 1024:.1f}KB.")
+            else:
+                # Stage C: Binary search on quality [40, 80] @ Z frames
+                print(f"[*] Stage C: Too big. Fixing at {fallback_frame_count} frames. Searching quality in [{quality_range_1[0]}, {quality_range_1[1]}]...")
+                final_frames = select_frames(all_frames, fallback_frame_count)
+                best_q, best_s = self._binary_search(SIZE_TARGET_RANGE, quality_range_1, eval_quality)
+
+                if best_q:
+                    final_quality = best_q
+                    current_size = best_s
+                    print(f"-> ☑️ Found solution: Q={final_quality}, size {current_size / 1024:.1f}KB.")
+                else:
+                    # Stage D: Binary search on frame count [1, Z] @ Q=40
+                    print(f"[*] Stage D: Still too big. Fixing quality at 40. Searching frames in [{int(frame_range_2[0])}, {int(frame_range_2[1])}]...")
+                    final_quality = 40
+                    best_f, best_s = self._binary_search(SIZE_TARGET_RANGE, frame_range_2, eval_frames)
+                    
+                    if best_f:
+                        final_frames = select_frames(all_frames, best_f)
+                        current_size = best_s
+                        print(f"-> ☑️ Found solution: {len(final_frames)} frames, size {current_size / 1024:.1f}KB.")
+                    else:
+                        # Stage E: Binary search on quality [1, 40] @ 1 frame
+                        print("[*] Stage E: Last resort! Fixing at 1 frame. Searching quality in [1, 40]...")
+                        final_frames = select_frames(all_frames, 1)
+                        final_quality = 40 # Start at 40
+                        best_q, best_s = self._binary_search(SIZE_TARGET_RANGE, quality_range_2, eval_quality)
+                        
+                        if best_q:
+                            final_quality = best_q
+                        else:
+                            # If all else fails, just take the smallest possible quality
+                             final_quality = 1
+                        
+                        current_size = self._save_webp_to_buffer(final_frames, final_quality, 1/original_duration)
+                        print(f"->⚠️ Extreme compression: 1 frame, Q={final_quality}, size {current_size / 1024:.1f}KB.")
+
+
+        # --- Stage 3: Final Save ---
+        try:
+            final_fps = len(final_frames) / original_duration
+            frame_duration = int(1000 / final_fps)
             
-            # Render all frames
-            frames = []
-            for i in range(total_frames):
-                # Map our frame index to the original animation frame range
-                original_frame = int(i * original_total_frames / total_frames)
-                frame = self._render_lottie_frame(lottie_animation, original_frame, total_frames)
-                frames.append(frame)
+            print(f"\nSaving final WebP to '{webp_path}' with {len(final_frames)} frames, Q={final_quality}, {final_fps:.1f} FPS.")
             
-            if not frames:
-                raise ValueError("No frames could be rendered from TGS file")
-            
-            # Calculate frame duration in milliseconds using the calculated FPS
-            frame_duration = int(1000 / self._calculated_fps)
-            
-            # Save as animated WebP
-            frames[0].save(
+            final_frames[0].save(
                 webp_path,
                 format='WebP',
                 save_all=True,
-                append_images=frames[1:],
+                append_images=final_frames[1:],
                 duration=frame_duration,
-                loop=0,  # Infinite loop
-                quality=self.quality,
-                method=6  # Best quality method
+                loop=0,
+                quality=final_quality,
+                method=6
             )
-            
             return True
-            
         except Exception as e:
-            raise IOError(f"Conversion failed: {e}")
+            raise IOError(f"Final WebP saving failed: {e}")
 
 
 def convert_tgs_to_webp(tgs_path: str, webp_path: str, 
