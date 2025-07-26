@@ -8,6 +8,7 @@ import asyncio
 from typing import List, Optional, Any
 from PIL import Image
 import logging
+import shutil
 
 from telethon import TelegramClient
 from telethon.tl.functions.messages import GetStickerSetRequest
@@ -25,7 +26,7 @@ logger = logging.getLogger(__name__)
 class StickerConverter:
     def __init__(self, client: TelegramClient):
         self.client = client
-    
+
     async def get_sticker_set(self, pack_input: Any):
         """
         Get sticker set from Telegram using either a short name (str) 
@@ -75,9 +76,13 @@ class StickerConverter:
             file_ext = os.path.splitext(input_path)[1].lower() if input_path else ''
             
             if file_ext == '.tgs':
-                return await asyncio.to_thread(convert_tgs_to_webp, input_path, output_path, quality=40, preserve_timing=True)
+                return await asyncio.to_thread(convert_tgs_to_webp, input_path, output_path, quality=80)
             elif file_ext in ['.webm', '.mp4', '.gif', '.mov', '.mkv']:
-                return await asyncio.to_thread(convert_video_to_webp, input_path, output_path, quality=80, preserve_timing=True)
+                return await asyncio.to_thread(convert_video_to_webp, input_path, output_path, quality=80)
+            elif file_ext == '.webp':
+                # If it's already a WebP, just copy it over. No need to re-process!
+                shutil.copy(input_path, output_path)
+                return True
             else: # Static image
                 with Image.open(input_path) as img:
                     if img.mode != 'RGBA':
@@ -132,9 +137,11 @@ class StickerConverter:
         os.makedirs(pack_temp_dir, exist_ok=True)
         
         try:
+            download_tasks = [self.download_sticker(sticker, pack_temp_dir) for sticker in stickers]
+            downloaded_sticker_paths = await asyncio.gather(*download_tasks)
+
             converted_stickers = []
-            for i, sticker in enumerate(stickers):
-                sticker_file = await self.download_sticker(sticker, pack_temp_dir)
+            for i, sticker_file in enumerate(downloaded_sticker_paths):
                 if not sticker_file:
                     continue
 
@@ -143,6 +150,7 @@ class StickerConverter:
                 if await self.convert_to_webp(sticker_file, webp_path):
                     converted_stickers.append(webp_path)
                 
+                # Clean up the original downloaded file
                 if os.path.exists(sticker_file):
                     os.remove(sticker_file)
             

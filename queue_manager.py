@@ -49,7 +49,7 @@ class QueueManager:
             self.user_queues[user_id] = queue_item
             
             logger.info(f"Added user {username} (ID: {user_id}) to queue for pack: {pack_input}")
-            return len(self.queue)
+            return self._get_position(user_id)
     
     async def get_next_item(self) -> Optional[QueueItem]:
         """Get next item to process"""

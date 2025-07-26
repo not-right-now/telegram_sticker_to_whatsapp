@@ -1,7 +1,8 @@
 """
 Video to WebP Converter Module supports many video formats like WEBM, MP4, GIF, MOV, MKV, etc.
 
-A simple Python module for converting various video formats (WebM, MP4, etc.) to animated WebP.
+A simple Python module for converting various video formats (WebM, MP4, etc.) to animated WebP while compressing it to a maximum size cap (Default is 500).
+It will basically allow output files between [400,500]KB if SIZE_CAP_KB is 500KB (Default).
 Features smart timing preservation and performance optimization.
 """
 
@@ -12,48 +13,38 @@ from PIL import Image, ImageDraw
 import argparse
 import sys
 import io
-
+import time
+import webp
 
 class VideoToWebPConverter:
     """Converter class for Video to animated WebP conversion with automatic timing preservation."""
     
-    def __init__(self, width: int = -1, height: int = -1, fps: float = 30.0, quality: int = 80, preserve_timing: bool = True):
+    def __init__(self, width: int = -1, height: int = -1, quality: int = 80):
         """
         Initialize the converter.
         
         Args:
             width: Output width in pixels (-1 for original)
             height: Output height in pixels (-1 for original)
-            fps: Target frames per second (ignored if preserve_timing=True)
             quality: WebP quality (0-100)
-            preserve_timing: If True, automatically adjusts FPS to preserve original video timing
         """
         self.width = width
         self.height = height
-        self.fps = fps
         self.quality = quality
-        self.preserve_timing = preserve_timing
-        self._calculated_fps = fps
 
-    def _save_webp_to_buffer(self, frames: list, quality: int, fps: float) -> int:
-        """Saves a list of frames to an in-memory WebP buffer and returns the size in bytes."""
+    def _create_webp_buffer(self, frames, quality, fps):
         if not frames:
-            return float('inf')
+            return None
 
-        frame_duration = int(1000 / fps)
-        buffer = io.BytesIO()
+        # write to a temp file
+        with tempfile.NamedTemporaryFile(suffix=".webp", delete=False) as tmp:
+            webp.save_images(frames, tmp.name, fps=fps, quality=quality)
+            tmp.flush()
 
-        frames[0].save(
-            buffer,
-            format='WebP',
-            save_all=True,
-            append_images=frames[1:],
-            duration=frame_duration,
-            loop=0,
-            quality=quality,
-            method=6
-        )
-        return buffer.getbuffer().nbytes
+            # read that file into BytesIO
+            buf = io.BytesIO(tmp.read())
+        return buf
+
     
     @staticmethod
     def _binary_search(target_range: tuple, search_space: tuple, evaluator_func) -> tuple[int, int]:
@@ -101,8 +92,6 @@ class VideoToWebPConverter:
         # Get video properties
         original_fps = cap.get(cv2.CAP_PROP_FPS)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        original_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        original_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
         if original_fps <= 0: original_fps = 30.0 # Default fallback
         if total_frames <= 0: raise ValueError("Video file appears to have no frames.")
@@ -126,7 +115,7 @@ class VideoToWebPConverter:
             frames.append(pil_image)
 
         cap.release()
-        return frames, original_fps, original_duration
+        return frames, original_duration
     
     def _create_fallback_frame(self, width: int, height: int, frame_num: int, total_frames: int) -> Image.Image:
         """Create a simple fallback frame when video processing fails."""
@@ -161,12 +150,14 @@ class VideoToWebPConverter:
         """
         Convert Video file to animated WebP with a size cap of ~500KB.
         """
+        start_time = time.monotonic()
         if not os.path.exists(video_path):
             raise FileNotFoundError(f"Video file not found: {video_path}")
 
         # --- Stage 1: Extract ALL Frames From Video ---
         try:
-            all_frames, original_fps, original_duration = self._extract_all_frames_from_video(video_path)
+            print("Pre-rendering all original frames... this might take a moment.")
+            all_frames, original_duration = self._extract_all_frames_from_video(video_path)
         except Exception as e:
             raise ValueError(f"Failed to extract frames from video: {e}")
 
@@ -176,14 +167,16 @@ class VideoToWebPConverter:
         original_total_frames = len(all_frames)
 
         # --- Stage 2: The Optimization Gauntlet! ---
-        SIZE_CAP_KB = 450
-        SIZE_TARGET_RANGE = (400 * 1024, SIZE_CAP_KB * 1024)
-        MAX_FRAMES_CAP = 60
+        SIZE_CAP_KB = 490
+        SIZE_TARGET_RANGE = ((SIZE_CAP_KB -100) * 1024, SIZE_CAP_KB * 1024)
+        MAX_FRAMES_CAP = 30
         FRAME_PIVOT = MAX_FRAMES_CAP // 2
 
         final_frames = None
         final_quality = self.quality
 
+        successful_buffer = None
+        
         def select_frames(source_frames, count):
             if count <= 0: return []
             if count >= len(source_frames): return source_frames
@@ -191,28 +184,49 @@ class VideoToWebPConverter:
             return [source_frames[i] for i in indices]
 
         def eval_frames(num_frames):
+            # To allow modification of the cache
+            nonlocal successful_buffer
             frames_to_test = select_frames(all_frames, num_frames)
             if not frames_to_test: return float('inf')
             fps = len(frames_to_test) / original_duration
-            return self._save_webp_to_buffer(frames_to_test, final_quality, fps)
+            
+            # store the result
+            buffer = self._create_webp_buffer(frames_to_test, final_quality, fps)
+            
+            if buffer:
+                successful_buffer = buffer
+                return buffer.getbuffer().nbytes
+            return float('inf')
+
 
         def eval_quality(quality):
+            # To allow modification of the buffer
+            nonlocal successful_buffer
             if not final_frames: return float('inf')
             fps = len(final_frames) / original_duration
-            return self._save_webp_to_buffer(final_frames, quality, fps)
+
+            # store the result
+            buffer = self._create_webp_buffer(final_frames, quality, fps)
+
+            if buffer:
+                successful_buffer = buffer
+                return buffer.getbuffer().nbytes
+            return float('inf')
 
         initial_frame_count = min(original_total_frames, MAX_FRAMES_CAP)
         final_frames = select_frames(all_frames, initial_frame_count)
 
-        print(f"Aiming for a file size under {SIZE_CAP_KB}KB.")
         print(f"[*] Stage A: Testing with {len(final_frames)} frames @ Q={final_quality}...")
-        current_size = self._save_webp_to_buffer(final_frames, final_quality, len(final_frames) / original_duration)
+        buffer = self._create_webp_buffer(final_frames, final_quality, len(final_frames) / original_duration)
+        current_size = buffer.getbuffer().nbytes if buffer else float('inf')
 
         if current_size <= SIZE_TARGET_RANGE[1]:
+            successful_buffer = buffer
             print(f"☑️ Success! Size is {current_size / 1024:.1f}KB. No further optimization needed.")
         else:
             print(f"->👎 Too big ({current_size / 1024:.1f}KB). Starting advanced optimization...")
-
+            
+            # --- Define search ranges ---
             if original_total_frames > MAX_FRAMES_CAP:
                 frame_range_1 = (FRAME_PIVOT, MAX_FRAMES_CAP)
                 frame_range_2 = (1, FRAME_PIVOT)
@@ -222,79 +236,67 @@ class VideoToWebPConverter:
                 frame_range_2 = (1, original_total_frames // 2)
                 fallback_frame_count = original_total_frames // 2
 
-            quality_range_1 = (40, 80)
-            quality_range_2 = (1, 40)
+            quality_range_1 = (int(self.quality / 2), self.quality)
+            quality_range_2 = (1, int(self.quality / 2))
 
+            # --- Start the search ---
+
+            # Stage B: Search frame count
             print(f"[*] Stage B: Searching frame count in [{int(frame_range_1[0])}, {int(frame_range_1[1])}] @ Q=80...")
             best_f, best_s = self._binary_search(SIZE_TARGET_RANGE, frame_range_1, eval_frames)
 
             if best_f:
-                final_frames = select_frames(all_frames, best_f)
-                current_size = best_s
-                print(f"-> ☑️ Found solution: {len(final_frames)} frames, size {current_size / 1024:.1f}KB.")
+                print(f"-> ☑️ Found solution in Stage B: {best_f} frames, size {best_s / 1024:.1f}KB.")
             else:
+                # Stage C: Search quality
                 print(f"[*] Stage C: Too big. Fixing at {fallback_frame_count} frames. Searching quality in [{quality_range_1[0]}, {quality_range_1[1]}]...")
                 final_frames = select_frames(all_frames, fallback_frame_count)
                 best_q, best_s = self._binary_search(SIZE_TARGET_RANGE, quality_range_1, eval_quality)
 
                 if best_q:
-                    final_quality = best_q
-                    current_size = best_s
-                    print(f"-> ☑️ Found solution: Q={final_quality}, size {current_size / 1024:.1f}KB.")
+                    print(f"-> ☑️ Found solution in Stage C: Q={best_q}, size {best_s / 1024:.1f}KB.")
                 else:
+                    # Stage D: Search frame count again
                     print(f"[*] Stage D: Still too big. Fixing quality at 40. Searching frames in [{int(frame_range_2[0])}, {int(frame_range_2[1])}]...")
                     final_quality = 40
                     best_f, best_s = self._binary_search(SIZE_TARGET_RANGE, frame_range_2, eval_frames)
 
                     if best_f:
-                        final_frames = select_frames(all_frames, best_f)
-                        current_size = best_s
-                        print(f"-> ☑️ Found solution: {len(final_frames)} frames, size {current_size / 1024:.1f}KB.")
+                        print(f"-> ☑️ Found solution in Stage D: {best_f} frames, size {best_s / 1024:.1f}KB.")
                     else:
-                        print("[*] Stage E: Last resort! Fixing at 1 frame. Searching quality in [1, 40]...")
+                        # Stage E: Last resort
+                        print("[*] Stage E: Last resort! Fixing at 1 frame. Searching quality in [{quality_range_2[0]}, {quality_range_2[1]}]...")
                         final_frames = select_frames(all_frames, 1)
-                        final_quality = 40
                         best_q, best_s = self._binary_search(SIZE_TARGET_RANGE, quality_range_2, eval_quality)
-
-                        if best_q:
-                            final_quality = best_q
-                        else:
-                            final_quality = 1
-
-                        current_size = self._save_webp_to_buffer(final_frames, final_quality, 1/original_duration)
+                        
+                        final_quality = best_q if best_q else 1
+                        successful_buffer = self._create_webp_buffer(final_frames, final_quality, 1/original_duration)
+                        current_size = successful_buffer.getbuffer().nbytes if successful_buffer else float('inf')
                         print(f"->⚠️ Extreme compression: 1 frame, Q={final_quality}, size {current_size / 1024:.1f}KB.")
 
         # --- Stage 3: Final Save ---
         try:
-            if not final_frames:
-                raise IOError("Optimization failed to produce any frames.")
+            if successful_buffer:
+                print(f"\nSaving final WebP to '{webp_path}'...")
+                with open(webp_path, 'wb') as f:
+                    f.write(successful_buffer.getvalue())
+                return True
+            else:
+                # If the buffer is STILL empty after all stages, the conversion failed.
+                raise ValueError("Could not produce a WebP file under the size limit after all optimizations.")
 
-            final_fps = len(final_frames) / original_duration
-            frame_duration = int(1000 / final_fps)
-
-            print(f"\nSaving final WebP to '{webp_path}' with {len(final_frames)} frames, Q={final_quality}, {final_fps:.1f} FPS.")
-
-            output_dir = os.path.dirname(webp_path)
-            if output_dir: os.makedirs(output_dir, exist_ok=True)
-
-            final_frames[0].save(
-                webp_path,
-                format='WebP',
-                save_all=True,
-                append_images=final_frames[1:],
-                duration=frame_duration,
-                loop=0,
-                quality=final_quality,
-                method=6
-            )
-            return True
         except Exception as e:
             raise IOError(f"Final WebP saving failed: {e}")
+        
+        finally:
+            end_time = time.monotonic()
+            duration = end_time - start_time
+            print(f"⌛ Total time taken: {duration:.2f} seconds.")
 
 
 def convert_video_to_webp(video_path: str, webp_path: str, 
                         width: int = -1, height: int = -1, 
-                        fps: float = 30.0, quality: int = 80, preserve_timing: bool = True) -> bool:
+                        quality: int = 80) -> bool:
     """
     Simple function to convert a video file to animated WebP with automatic timing preservation.
     
@@ -303,21 +305,13 @@ def convert_video_to_webp(video_path: str, webp_path: str,
         webp_path: Path to output WebP file
         width: Output width in pixels (default: Original)
         height: Output height in pixels (default: Original)
-        fps: Target frames per second (ignored if preserve_timing=True, default: 30.0)
         quality: WebP quality 0-100 (default: 80)
-        preserve_timing: Automatically preserve original video timing (default: True)
         
     Returns:
         True if conversion successful, False otherwise
         
-    Example:
-        >>> from video_to_webp import convert_video_to_webp
-        >>> # Automatic timing preservation (recommended)
-        >>> success = convert_video_to_webp('video.mp4', 'video.webp')
-        >>> # Manual FPS control
-        >>> success = convert_video_to_webp('video.mp4', 'video.webp', fps=20, preserve_timing=False)
     """
-    converter = VideoToWebPConverter(width, height, fps, quality, preserve_timing)
+    converter = VideoToWebPConverter(width, height, quality)
     try:
         return converter.convert(video_path, webp_path)
     except Exception as e:
@@ -339,11 +333,6 @@ if __name__ == "__main__":
     parser.add_argument("--width", type=int, default=-1, help="Output width in pixels. Default: Original.")
     parser.add_argument("--height", type=int, default=-1, help="Output height in pixels. Default: Original.")
     parser.add_argument("--quality", type=int, default=80, help="WebP quality (0-100). Default: 80.")
-    parser.add_argument("--fps", type=float, default=30.0,
-                        help="Frames per second. \n(Note: This is ignored by default unless you disable timing preservation).")
-
-    parser.add_argument("--no-preserve-timing", action="store_false", dest="preserve_timing",
-                        help="Disable automatic timing preservation to use the manual FPS value.")
 
     args = parser.parse_args()
 
@@ -354,8 +343,6 @@ if __name__ == "__main__":
         width=args.width,
         height=args.height,
         quality=args.quality,
-        fps=args.fps,
-        preserve_timing=args.preserve_timing
     )
 
     if success:

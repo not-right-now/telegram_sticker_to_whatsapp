@@ -7,6 +7,7 @@ import asyncio
 import logging
 from telethon import TelegramClient, events, Button
 from telethon.errors.rpcerrorlist import UserNotParticipantError
+from telethon.events import StopPropagation
 from telethon.tl.functions.channels import GetParticipantRequest
 from telethon.tl.types import DocumentAttributeSticker
 
@@ -83,6 +84,7 @@ class BotHandlers:
             [Button.inline("📊 Check Queue", b"check_queue"), Button.inline("❓ Help", b"help")]
         ]
         await event.reply(START_MESSAGE, buttons=buttons)
+        raise StopPropagation
 
     async def help_command(self, event: events.NewMessage.Event):
         """Handle /help command."""
@@ -90,6 +92,7 @@ class BotHandlers:
             [Button.inline("📊 Check Queue", b"check_queue"), Button.inline("🏠 Back to Start", b"start")]
         ]
         await event.reply(HELP_MESSAGE, buttons=buttons)
+        raise StopPropagation
 
     async def handle_message(self, event: events.NewMessage.Event):
         """Handle incoming messages (URLs or stickers)."""
@@ -157,7 +160,8 @@ class BotHandlers:
                 item = await queue_manager.get_next_item()
                 if not item:
                     break
-                
+
+                success = False 
                 try:
                     await self.client.send_message(item.chat_id, f"🚀 Starting conversion for your requested sticker pack...")
                     
@@ -165,7 +169,7 @@ class BotHandlers:
                     if not sticker_set:
                         error_pack_name = item.pack_input if isinstance(item.pack_input, str) else "the pack you sent"
                         await self.client.send_message(item.chat_id, f"❌ Failed to find sticker pack: `{error_pack_name}`. It might be private or invalid.")
-                        await queue_manager.complete_processing(item.user_id, False)
+                        # success is still false
                         continue
                     
                     pack_title = sticker_set.set.title
@@ -187,17 +191,21 @@ class BotHandlers:
                             os.remove(file_path)
                         
                         await self.client.send_message(item.chat_id, "📱 To import to WhatsApp, use an app like 'Sticker Maker' on your phone. Enjoy!")
-                        await queue_manager.complete_processing(item.user_id, True)
+                        success = True
                     else:
                         await self.client.send_message(item.chat_id, f"❌ Failed to convert the sticker pack '{pack_title}'. There might have been an issue with the sticker files themselves.")
-                        await queue_manager.complete_processing(item.user_id, False)
-                
+                        # success is still false
+
                 except Exception as e:
                     logger.error(f"Error processing queue item for user {item.user_id}: {e}", exc_info=True)
                     try:
                         await self.client.send_message(item.chat_id, "❌ An unexpected error occurred during conversion. The developers have been notified. Please try again later.")
                     except: pass
-                    await queue_manager.complete_processing(item.user_id, False)
+                    # success is still false
+
+                finally:
+                    await queue_manager.complete_processing(item.user_id, success)                
+
 
     async def handle_callback_query(self, event: events.CallbackQuery.Event):
         """Handle callback queries from inline keyboards."""
@@ -231,7 +239,14 @@ class BotHandlers:
             await event.edit(message, buttons=buttons)
         
         elif data == "help":
-            await self.help_command(event)
+            buttons = [
+                [Button.inline("📊 Check Queue", b"check_queue"), Button.inline("🏠 Back to Start", b"start")]
+            ]
+            await event.edit(HELP_MESSAGE, buttons=buttons)
 
         elif data == "start":
-            await self.start_command(event)
+            buttons = [
+                [Button.inline("📊 Check Queue", b"check_queue"), Button.inline("❓ Help", b"help")]
+            ]
+            await event.edit(START_MESSAGE, buttons=buttons)
+

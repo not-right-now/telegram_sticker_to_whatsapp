@@ -1,7 +1,8 @@
 """
 TGS to WebP Converter Module
 
-A simple Python module for converting TGS (Telegram animated stickers) to WebP format.
+A simple Python module for converting TGS (Telegram animated stickers) to WebP format while compressing it to a maximum size cap (Default is 500).
+It will basically allow output files between [400,500]KB if SIZE_CAP_KB is 500KB (Default).
 TGS files are gzip-compressed Lottie JSON animations.
 """
 
@@ -9,50 +10,41 @@ import os
 import tempfile
 import io
 from PIL import Image, ImageDraw
-from lottie import objects
-from lottie.exporters.cairo import export_png
 from lottie.parsers.tgs import parse_tgs
-
-
+from lottie.exporters.cairo import cairosvg
+from lottie.exporters.svg import export_svg
+import time
+import webp
 class TGSToWebPConverter:
     """Converter class for TGS to WebP conversion with automatic timing preservation."""
     
-    def __init__(self, width: int = -1, height: int = -1, fps: int = 30, quality: int = 80, preserve_timing: bool = True):
+    def __init__(self, width: int = -1, height: int = -1, quality: int = 80):
         """
         Initialize the converter.
         
         Args:
             width: Output width in pixels
             height: Output height in pixels
-            fps: Target frames per second (ignored if preserve_timing=True)
             quality: WebP quality (0-100)
-            preserve_timing: If True, automatically adjusts FPS to preserve original animation timing
         """
         self.width = width
         self.height = height
-        self.fps = fps
         self.quality = quality
-        self.preserve_timing = preserve_timing
     
-    def _save_webp_to_buffer(self, frames: list, quality: int, fps: float) -> int:
-        """Saves a list of frames to an in-memory WebP buffer and returns the size in bytes."""
+    def _create_webp_buffer(self, frames, quality, fps):
         if not frames:
-            return float('inf')  # Return infinity if no frames to avoid errors
+            return None
 
-        frame_duration = int(1000 / fps)
-        buffer = io.BytesIO()
+        # 1. write to a temp file
+        with tempfile.NamedTemporaryFile(suffix=".webp", delete=False) as tmp:
+            webp.save_images(frames, tmp.name, fps=fps, quality=quality)
+            tmp.flush()
 
-        frames[0].save(
-            buffer,
-            format='WebP',
-            save_all=True,
-            append_images=frames[1:],
-            duration=frame_duration,
-            loop=0,
-            quality=quality,
-            method=6
-        )
-        return buffer.getbuffer().nbytes
+            # 2. read that file into BytesIO
+            buf = io.BytesIO(tmp.read())
+        return buf
+
+
     
     @staticmethod
     def _binary_search(target_range: tuple, search_space: tuple, evaluator_func) -> tuple[int, int]:
@@ -96,7 +88,7 @@ class TGSToWebPConverter:
                 # The file is too big, we must reduce quality/frames.
                 high = mid - 1
         
-        # If we never hit the target range exactly, return the best value found that was *under* the max
+        # If we never hit the target range exactly, return the best value found that was under the max
         # This is useful if the target range [400, 500] is missed, but we found a solution that is, say, 390KB.
         if best_value is not None and best_size <= target_range[1]:
              return best_value, best_size
@@ -105,45 +97,38 @@ class TGSToWebPConverter:
     
     def _render_lottie_frame(self, lottie_animation, frame_num: int, total_frames: int) -> Image.Image:
         """
-        Render a single frame from Lottie animation using the lottie library.
-        
-        Args:
-            lottie_animation: Lottie animation object
-            frame_num: Current frame number
-            total_frames: Total number of frames
-            
-        Returns:
-            PIL Image of the rendered frame
+        Render a single frame from Lottie animation directly to an in-memory buffer
+        by converting Lottie -> SVG (in a text buffer) -> PNG (in a bytes buffer).
         """
-        try: 
-            # Create a temporary file for the frame
-            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as temp_file:
-                temp_path = temp_file.name
-            
-            # Calculate the frame time based on the animation
-            frame_time = frame_num / self.fps
-            
-            # Export single frame as PNG using Cairo
-            export_png(
-                lottie_animation,
-                temp_path,
-                frame=frame_num
-            )
-            
-            # Load the generated PNG
-            if os.path.exists(temp_path):
-                img = Image.open(temp_path).convert('RGBA')
-                # Check for cusrrom width and hight and resize if any
-                if self.width != -1 and self.height != -1:
-                    img = img.resize((self.width, self.height), Image.LANCZOS)
-                os.unlink(temp_path)  # Clean up temp file
-                return img
-            else:
-                raise Exception("Frame export failed")
+        try:
+            # Step 1: Use io.StringIO to create a buffer for TEXT data.
+            svg_text_buffer = io.StringIO()
+            export_svg(lottie_animation, svg_text_buffer, frame=frame_num)
+            svg_text = svg_text_buffer.getvalue()
+
+            # Step 2: Convert the SVG text (str) into binary data (bytes) using UTF-8 encoding.
+            svg_bytes = svg_text.encode('utf-8')
+
+            # Step 3: Convert the in-memory SVG bytes to in-memory PNG bytes.
+            png_buffer = io.BytesIO()
+            cairosvg.svg2png(bytestring=svg_bytes, write_to=png_buffer)
+            png_buffer.seek(0)
+
+            # Step 4: Load the PNG from the binary buffer into a PIL Image.
+            img = Image.open(png_buffer).convert('RGBA')
+
+            # Resize if needed
+            if self.width != -1 and self.height != -1:
+                img = img.resize((self.width, self.height), Image.LANCZOS)
+                
+            return img
                 
         except Exception as e:
+            # The fallback will catch any errors in this new process
             print(f"Warning: Lottie frame rendering failed, using fallback: {e}")
             return self._create_fallback_frame(lottie_animation, frame_num, total_frames)
+
+
     
     def _create_fallback_frame(self, lottie_animation, frame_num: int, total_frames: int) -> Image.Image:
         """Create a simple fallback frame when Lottie rendering fails."""
@@ -174,6 +159,7 @@ class TGSToWebPConverter:
         """
         Convert TGS file to animated WebP with a size cap of ~500KB.
         """
+        start_time = time.monotonic()
         if not os.path.exists(tgs_path):
             raise FileNotFoundError(f"TGS file not found: {tgs_path}")
 
@@ -195,16 +181,18 @@ class TGSToWebPConverter:
             raise ValueError("Could not render any frames from the TGS file.")
 
         # --- Stage 2: The Optimization Gauntlet! ---
-        SIZE_CAP_KB = 450
-        SIZE_TARGET_RANGE = (400 * 1024, SIZE_CAP_KB * 1024)  # Target [400KB, 500KB]
-        MAX_FRAMES_CAP = 60
+        SIZE_CAP_KB = 490 # size cap
+        SIZE_TARGET_RANGE = ((SIZE_CAP_KB-100) * 1024, SIZE_CAP_KB * 1024)  # Target [400KB, 500KB]
+        MAX_FRAMES_CAP = 30
         FRAME_PIVOT = MAX_FRAMES_CAP // 2
 
         final_frames = None
         final_quality = self.quality # Start with default quality
-        
+        successful_buffer = None
         # Helper to select a subset of frames evenly
         def select_frames(source_frames, count):
+            if count <= 0 or len(source_frames) <= 0:
+             return []
             if count >= len(source_frames):
                 return source_frames
             indices = [int(i * (len(source_frames) - 1) / (count - 1)) for i in range(count)]
@@ -212,13 +200,31 @@ class TGSToWebPConverter:
 
         # Define evaluators for binary search
         def eval_frames(num_frames):
+            nonlocal successful_buffer
             frames_to_test = select_frames(all_frames, num_frames)
             fps = len(frames_to_test) / original_duration
-            return self._save_webp_to_buffer(frames_to_test, final_quality, fps)
+            
+            # Create the buffer
+            buffer = self._create_webp_buffer(frames_to_test, final_quality, fps)
+            
+            # IMPORTANT: Store the buffer if it was created
+            if buffer:
+                successful_buffer = buffer
+                return buffer.getbuffer().nbytes
+            return float('inf')
 
         def eval_quality(quality):
+            nonlocal successful_buffer
             fps = len(final_frames) / original_duration
-            return self._save_webp_to_buffer(final_frames, quality, fps)
+
+            # Create the buffer
+            buffer = self._create_webp_buffer(final_frames, quality, fps)
+            
+            # IMPORTANT: Store the buffer if it was created
+            if buffer:
+                successful_buffer = buffer
+                return buffer.getbuffer().nbytes
+            return float('inf')
             
         # Determine initial frame count based on caps
         initial_frame_count = min(original_total_frames, MAX_FRAMES_CAP)
@@ -229,9 +235,13 @@ class TGSToWebPConverter:
 
         # Stage A: Try with max frames at default quality
         print(f"[*] Stage A: Testing with {len(final_frames)} frames @ Q={final_quality}...")
-        current_size = self._save_webp_to_buffer(final_frames, final_quality, len(final_frames) / original_duration)
+        buffer = self._create_webp_buffer(final_frames, final_quality, len(final_frames) / original_duration)
+        current_size = buffer.getbuffer().nbytes if buffer else float('inf')
+
         
         if current_size <= SIZE_TARGET_RANGE[1]:
+            # It's a success! Hold on to this buffer for the final save.
+            successful_buffer = buffer
             print(f"☑️ Success! Size is {current_size / 1024:.1f}KB. No further optimization needed.")
         else:
             print(f"-> Too big ({current_size / 1024:.1f}KB). Starting advanced optimization...")
@@ -241,24 +251,21 @@ class TGSToWebPConverter:
             if original_total_frames > MAX_FRAMES_CAP:
                 frame_range_1 = (FRAME_PIVOT, MAX_FRAMES_CAP)
                 frame_range_2 = (1, FRAME_PIVOT)
-                quality_range_1 = (40, 80)
-                quality_range_2 = (1, 40)
                 fallback_frame_count = FRAME_PIVOT
             else:
                 frame_range_1 = (original_total_frames / 2, original_total_frames)
                 frame_range_2 = (1, original_total_frames / 2)
-                quality_range_1 = (40, 80)
-                quality_range_2 = (1, 40)
                 fallback_frame_count = int(original_total_frames / 2)
+
+            quality_range_1 = (int(self.quality / 2), self.quality)
+            quality_range_2 = (1, int(self.quality / 2))
 
             # Stage B: Binary search on frame count [X, Y] @ Q=80
             print(f"[*] Stage B: Searching frame count in [{int(frame_range_1[0])}, {int(frame_range_1[1])}] @ Q=80...")
             best_f, best_s = self._binary_search(SIZE_TARGET_RANGE, frame_range_1, eval_frames)
 
             if best_f:
-                final_frames = select_frames(all_frames, best_f)
-                current_size = best_s
-                print(f"-> ☑️ Found solution: {len(final_frames)} frames, size {current_size / 1024:.1f}KB.")
+                print(f"-> ☑️ Found solution in Stage B: {best_f} frames, size {best_s / 1024:.1f}KB.")
             else:
                 # Stage C: Binary search on quality [40, 80] @ Z frames
                 print(f"[*] Stage C: Too big. Fixing at {fallback_frame_count} frames. Searching quality in [{quality_range_1[0]}, {quality_range_1[1]}]...")
@@ -266,9 +273,7 @@ class TGSToWebPConverter:
                 best_q, best_s = self._binary_search(SIZE_TARGET_RANGE, quality_range_1, eval_quality)
 
                 if best_q:
-                    final_quality = best_q
-                    current_size = best_s
-                    print(f"-> ☑️ Found solution: Q={final_quality}, size {current_size / 1024:.1f}KB.")
+                    print(f"-> ☑️ Found solution in Stage C: Q={best_q}, size {best_s / 1024:.1f}KB.")
                 else:
                     # Stage D: Binary search on frame count [1, Z] @ Q=40
                     print(f"[*] Stage D: Still too big. Fixing quality at 40. Searching frames in [{int(frame_range_2[0])}, {int(frame_range_2[1])}]...")
@@ -276,9 +281,7 @@ class TGSToWebPConverter:
                     best_f, best_s = self._binary_search(SIZE_TARGET_RANGE, frame_range_2, eval_frames)
                     
                     if best_f:
-                        final_frames = select_frames(all_frames, best_f)
-                        current_size = best_s
-                        print(f"-> ☑️ Found solution: {len(final_frames)} frames, size {current_size / 1024:.1f}KB.")
+                        print(f"-> ☑️ Found solution in Stage D: {best_f} frames, size {best_s / 1024:.1f}KB.")
                     else:
                         # Stage E: Binary search on quality [1, 40] @ 1 frame
                         print("[*] Stage E: Last resort! Fixing at 1 frame. Searching quality in [1, 40]...")
@@ -291,36 +294,35 @@ class TGSToWebPConverter:
                         else:
                             # If all else fails, just take the smallest possible quality
                              final_quality = 1
-                        
-                        current_size = self._save_webp_to_buffer(final_frames, final_quality, 1/original_duration)
+                        successful_buffer = self._create_webp_buffer(final_frames, final_quality, 1/original_duration)
                         print(f"->⚠️ Extreme compression: 1 frame, Q={final_quality}, size {current_size / 1024:.1f}KB.")
 
 
         # --- Stage 3: Final Save ---
         try:
-            final_fps = len(final_frames) / original_duration
-            frame_duration = int(1000 / final_fps)
-            
-            print(f"\nSaving final WebP to '{webp_path}' with {len(final_frames)} frames, Q={final_quality}, {final_fps:.1f} FPS.")
-            
-            final_frames[0].save(
-                webp_path,
-                format='WebP',
-                save_all=True,
-                append_images=final_frames[1:],
-                duration=frame_duration,
-                loop=0,
-                quality=final_quality,
-                method=6
-            )
-            return True
+            if successful_buffer:
+                print(f"\nWriting final WebP to '{webp_path}'...")
+                with open(webp_path, 'wb') as f:
+                    # Simply write the bytes from the buffer we already created!
+                    f.write(successful_buffer.getvalue())
+                return True
+            else:
+                 # If the buffer is STILL empty after all stages, the conversion failed.
+                raise ValueError("Could not produce a WebP file under the size limit after all optimizations.")
+    
         except Exception as e:
             raise IOError(f"Final WebP saving failed: {e}")
+        
+        finally:
+            end_time = time.monotonic()
+            duration = end_time - start_time
+            print(f"⌛ Total time taken: {duration:.2f} seconds.")
+
 
 
 def convert_tgs_to_webp(tgs_path: str, webp_path: str, 
-                       width: int = -1, height: int = -1, 
-                       fps: int = 30, quality: int = 80, preserve_timing: bool = True) -> bool:
+                       width: int = -1, height: int = -1
+                       , quality: int = 80) -> bool:
     """
     Simple function to convert TGS to WebP with automatic timing preservation.
     
@@ -329,21 +331,12 @@ def convert_tgs_to_webp(tgs_path: str, webp_path: str,
         webp_path: Path to output WebP file
         width: Output width in pixels (default: Original)
         height: Output height in pixels (default: Original)
-        fps: Target frames per second (ignored if preserve_timing=True, default: 30)
         quality: WebP quality 0-100 (default: 80)
-        preserve_timing: Automatically preserve original animation timing (default: True)
         
     Returns:
         True if conversion successful, False otherwise
-        
-    Example:
-        >>> from tgs_to_webp import convert_tgs_to_webp
-        >>> # Automatic timing preservation (recommended)
-        >>> success = convert_tgs_to_webp('sticker.tgs', 'sticker.webp')
-        >>> # Manual FPS control
-        >>> success = convert_tgs_to_webp('sticker.tgs', 'sticker.webp', fps=20, preserve_timing=False)
     """
-    converter = TGSToWebPConverter(width, height, fps, quality, preserve_timing)
+    converter = TGSToWebPConverter(width, height, quality)
     try:
         return converter.convert(tgs_path, webp_path)
     except Exception as e:
@@ -370,12 +363,6 @@ if __name__ == "__main__":
     parser.add_argument("--width", type=int, default=-1, help="Output width in pixels. Default: Original.")
     parser.add_argument("--height", type=int, default=-1, help="Output height in pixels. Default: Original.")
     parser.add_argument("--quality", type=int, default=80, help="WebP quality (0-100). Default: 80.")
-    parser.add_argument("--fps", type=int, default=30,
-                        help="Frames per second. \n(Note: This is ignored by default unless you disable timing preservation).")
-
-    # This is a cool way to handle a boolean flag
-    parser.add_argument("--no-preserve-timing", action="store_false", dest="preserve_timing",
-                        help="Disable automatic timing preservation to use the manual FPS value.")
 
     # Let argparse handle the arguments
     args = parser.parse_args()
@@ -386,9 +373,7 @@ if __name__ == "__main__":
         webp_path=args.output_file,
         width=args.width,
         height=args.height,
-        quality=args.quality,
-        fps=args.fps,
-        preserve_timing=args.preserve_timing
+        quality=args.quality
     )
 
     if success:
